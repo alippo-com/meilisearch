@@ -574,6 +574,18 @@ impl<'a, 'i> Transform<'a, 'i> {
         // we recreate a json containing only the fields that needs to be flattened.
         // all the raw values get inserted directly in the `key_value` vec.
         for (key, value) in obkv.iter() {
+            let key_name = fields_ids_map.name(key).ok_or(FieldIdMapMissingEntry::FieldId {
+                field_id: key,
+                process: "Flatten from fields ids map.",
+            })?;
+
+            // Skip flattening for certain fields like `contentV3.attachments`
+            if key_name.starts_with("contentV3") || key_name.starts_with("replyToMsgDoc") 
+            {
+                tracing::debug!("Skipping flattening for field: {}", key_name);
+                key_value.push((key, value.into()));
+                continue;
+            }
             if json_depth_checker::should_flatten_from_unchecked_slice(value) {
                 let key = fields_ids_map.name(key).ok_or(FieldIdMapMissingEntry::FieldId {
                     field_id: key,
