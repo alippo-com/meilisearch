@@ -60,6 +60,8 @@ impl<'a> PrimaryKey<'a> {
                 Some(document_id_bytes) => {
                     let document_id = serde_json::from_slice(document_id_bytes)
                         .map_err(InternalError::SerdeJson)?;
+                    // Print the document_id
+                    println!("Document ID: {:?}", document_id);
                     match validate_document_id_value(document_id) {
                         Ok(document_id) => Ok(Ok(document_id)),
                         Err(user_error) => {

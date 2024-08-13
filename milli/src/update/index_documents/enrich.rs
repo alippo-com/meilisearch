@@ -29,82 +29,97 @@ pub fn enrich_documents_batch<R: Read + Seek>(
     autogenerate_docids: bool,
     reader: DocumentsBatchReader<R>,
 ) -> Result<StdResult<EnrichedDocumentsBatchReader<R>, UserError>> {
+    tracing::debug!("Entering enrich_documents_batch function");
+
     let (mut cursor, mut documents_batch_index) = reader.into_cursor_and_fields_index();
+    tracing::debug!("Initialized cursor and documents_batch_index");
 
     let mut external_ids = tempfile::tempfile().map(BufWriter::new).map(grenad::Writer::new)?;
     let mut uuid_buffer = [0; uuid::fmt::Hyphenated::LENGTH];
+    tracing::debug!("Initialized external_ids and uuid_buffer");
 
-    // The primary key *field id* that has already been set for this index or the one
-    // we will guess by searching for the first key that contains "id" as a substring.
     let primary_key = match index.primary_key(rtxn)? {
         Some(primary_key) => match PrimaryKey::new(primary_key, &documents_batch_index) {
-            Some(primary_key) => primary_key,
-            None if autogenerate_docids => PrimaryKey::Flat {
-                name: primary_key,
-                field_id: documents_batch_index.insert(primary_key),
-            },
+            Some(primary_key) => {
+                tracing::debug!("Primary key found: {:?}", primary_key);
+                primary_key
+            }
+            None if autogenerate_docids => {
+                tracing::debug!("Primary key not found, auto-generating document IDs");
+                PrimaryKey::Flat {
+                    name: primary_key,
+                    field_id: documents_batch_index.insert(primary_key),
+                }
+            }
             None => {
+                tracing::debug!("Primary key not found and auto-generate is disabled");
                 return match cursor.next_document()? {
-                    Some(first_document) => Ok(Err(UserError::MissingDocumentId {
-                        primary_key: primary_key.to_string(),
-                        document: obkv_to_object(&first_document, &documents_batch_index)?,
-                    })),
+                    Some(first_document) => {
+                        tracing::debug!("First document found: {:?}", first_document);
+                        Ok(Err(UserError::MissingDocumentId {
+                            primary_key: primary_key.to_string(),
+                            document: obkv_to_object(&first_document, &documents_batch_index)?,
+                        }))
+                    }
                     None => unreachable!("Called with reader.is_empty()"),
                 };
             }
         },
         None => {
+            tracing::debug!("Primary key not specified in index, guessing primary key");
             let mut guesses: Vec<(u16, &str)> = documents_batch_index
                 .iter()
                 .filter(|(_, name)| name.to_lowercase().ends_with(DEFAULT_PRIMARY_KEY))
                 .map(|(field_id, name)| (*field_id, name.as_str()))
                 .collect();
 
-            // sort the keys in a deterministic, obvious way, so that fields are always in the same order.
             guesses.sort_by(|(_, left_name), (_, right_name)| {
-                // shortest name first
-                left_name.len().cmp(&right_name.len()).then_with(
-                    // then alphabetical order
-                    || left_name.cmp(right_name),
-                )
+                left_name.len().cmp(&right_name.len()).then_with(|| left_name.cmp(right_name))
             });
 
             match guesses.as_slice() {
-                [] if autogenerate_docids => PrimaryKey::Flat {
-                    name: DEFAULT_PRIMARY_KEY,
-                    field_id: documents_batch_index.insert(DEFAULT_PRIMARY_KEY),
-                },
-                [] => return Ok(Err(UserError::NoPrimaryKeyCandidateFound)),
+                [] if autogenerate_docids => {
+                    tracing::debug!("No primary key candidates found, auto-generating document IDs");
+                    PrimaryKey::Flat {
+                        name: DEFAULT_PRIMARY_KEY,
+                        field_id: documents_batch_index.insert(DEFAULT_PRIMARY_KEY),
+                    }
+                }
+                [] => {
+                    tracing::debug!("No primary key candidates found and auto-generate is disabled");
+                    return Ok(Err(UserError::NoPrimaryKeyCandidateFound));
+                }
                 [(field_id, name)] => {
                     tracing::info!("Primary key was not specified in index. Inferred to '{name}'");
                     PrimaryKey::Flat { name, field_id: *field_id }
                 }
                 multiple => {
+                    tracing::debug!("Multiple primary key candidates found: {:?}", multiple);
                     return Ok(Err(UserError::MultiplePrimaryKeyCandidatesFound {
-                        candidates: multiple
-                            .iter()
-                            .map(|(_, candidate)| candidate.to_string())
-                            .collect(),
+                        candidates: multiple.iter().map(|(_, candidate)| candidate.to_string()).collect(),
                     }));
                 }
             }
         }
     };
 
-    // If the settings specifies that a _geo field must be used therefore we must check the
-    // validity of it in all the documents of this batch and this is when we return `Some`.
     let geo_field_id = match documents_batch_index.id("_geo") {
         Some(geo_field_id)
             if index.sortable_fields(rtxn)?.contains("_geo")
                 || index.filterable_fields(rtxn)?.contains("_geo") =>
         {
+            tracing::debug!("Geo field ID found: {:?}", geo_field_id);
             Some(geo_field_id)
         }
-        _otherwise => None,
+        _otherwise => {
+            tracing::debug!("Geo field ID not found or not sortable/filterable");
+            None
+        }
     };
 
     let mut count = 0;
     while let Some(document) = cursor.next_document()? {
+        tracing::debug!("Processing document number: {}", count);
         let document_id = match fetch_or_generate_document_id(
             &document,
             &documents_batch_index,
@@ -113,18 +128,27 @@ pub fn enrich_documents_batch<R: Read + Seek>(
             &mut uuid_buffer,
             count,
         )? {
-            Ok(document_id) => document_id,
-            Err(user_error) => return Ok(Err(user_error)),
+            Ok(document_id) => {
+                tracing::debug!("Document ID generated/retrieved: {:?}", document_id);
+                document_id
+            }
+            Err(user_error) => {
+                tracing::debug!("Error generating/retrieving document ID: {:?}", user_error);
+                return Ok(Err(user_error));
+            }
         };
 
         if let Some(geo_value) = geo_field_id.and_then(|fid| document.get(fid)) {
+            tracing::debug!("Geo value found: {:?}", geo_value);
             if let Err(user_error) = validate_geo_from_json(&document_id, geo_value)? {
+                tracing::debug!("Error validating geo value: {:?}", user_error);
                 return Ok(Err(UserError::from(user_error)));
             }
         }
 
         let document_id = serde_json::to_vec(&document_id).map_err(InternalError::SerdeJson)?;
         external_ids.insert(count.to_be_bytes(), document_id)?;
+        tracing::debug!("Inserted document ID into external_ids");
 
         count += 1;
     }
@@ -136,14 +160,15 @@ pub fn enrich_documents_batch<R: Read + Seek>(
         primary_key_name,
         external_ids,
     )?;
+    tracing::debug!("Created EnrichedDocumentsBatchReader");
 
+    tracing::debug!("Exiting enrich_documents_batch function");
     Ok(Ok(reader))
 }
 
 /// Retrieve the document id after validating it, returning a `UserError`
 /// if the id is invalid or can't be guessed.
-#[tracing::instrument(level = "trace", skip(uuid_buffer, documents_batch_index, document)
-target = "indexing::documents")]
+#[tracing::instrument(level = "trace", target = "indexing::documents")]
 fn fetch_or_generate_document_id(
     document: &obkv::KvReader<'_, FieldId>,
     documents_batch_index: &DocumentsBatchIndex,
@@ -152,24 +177,40 @@ fn fetch_or_generate_document_id(
     uuid_buffer: &mut [u8; uuid::fmt::Hyphenated::LENGTH],
     count: u32,
 ) -> Result<StdResult<DocumentId, UserError>> {
-    Ok(match primary_key.document_id(document, documents_batch_index)? {
-        Ok(document_id) => Ok(DocumentId::Retrieved { value: document_id }),
-        Err(DocumentIdExtractionError::InvalidDocumentId(user_error)) => Err(user_error),
+    tracing::debug!("Entering fetch_or_generate_document_id function");
+
+    let result = match primary_key.document_id(document, documents_batch_index)? {
+        Ok(document_id) => {
+            tracing::debug!("Document ID retrieved successfully: {:?}", document_id);
+            Ok(DocumentId::Retrieved { value: document_id })
+        }
+        Err(DocumentIdExtractionError::InvalidDocumentId(user_error)) => {
+            tracing::debug!("Invalid Document ID error: {:?}", user_error);
+            Err(user_error)
+        }
         Err(DocumentIdExtractionError::MissingDocumentId) if autogenerate_docids => {
+            tracing::debug!("Missing Document ID, generating new UUID");
             let uuid = uuid::Uuid::new_v4().as_hyphenated().encode_lower(uuid_buffer);
             Ok(DocumentId::Generated { value: uuid.to_string(), document_nth: count })
         }
-        Err(DocumentIdExtractionError::MissingDocumentId) => Err(UserError::MissingDocumentId {
-            primary_key: primary_key.name().to_string(),
-            document: obkv_to_object(document, documents_batch_index)?,
-        }),
+        Err(DocumentIdExtractionError::MissingDocumentId) => {
+            tracing::debug!("Missing Document ID and auto-generate is disabled");
+            Err(UserError::MissingDocumentId {
+                primary_key: primary_key.name().to_string(),
+                document: obkv_to_object(document, documents_batch_index)?,
+            })
+        }
         Err(DocumentIdExtractionError::TooManyDocumentIds(_)) => {
+            tracing::debug!("Too many Document IDs error");
             Err(UserError::TooManyDocumentIds {
                 primary_key: primary_key.name().to_string(),
                 document: obkv_to_object(document, documents_batch_index)?,
             })
         }
-    })
+    };
+
+    tracing::debug!("Exiting fetch_or_generate_document_id function with result: {:?}", result);
+    Ok(result)
 }
 
 /// A type that represents a document id that has been retrieved from a document or auto-generated.

@@ -134,22 +134,20 @@ where
         })
     }
 
-    /// Adds a batch of documents to the current builder.
-    ///
-    /// Since the documents are progressively added to the writer, a failure will cause only
-    /// return an error and not the `IndexDocuments` struct as it is invalid to use it afterward.
-    ///
-    /// Returns the number of documents added to the builder.
     #[tracing::instrument(level = "trace", skip_all, target = "indexing::documents")]
     pub fn add_documents<R: Read + Seek>(
         mut self,
         reader: DocumentsBatchReader<R>,
     ) -> Result<(Self, StdResult<u64, UserError>)> {
+        tracing::debug!("Entering add_documents function");
+
         // Early return when there is no document to add
         if reader.is_empty() {
+            tracing::debug!("No documents to add, returning early with 0 documents added");
             return Ok((self, Ok(0)));
         }
 
+        tracing::debug!("Validating and enriching documents");
         // We check for user errors in this validator and if there is one, we can return
         // the `IndexDocument` struct as it is valid to send more documents into it.
         // However, if there is an internal error we throw it away!
@@ -159,10 +157,17 @@ where
             self.config.autogenerate_docids,
             reader,
         )? {
-            Ok(reader) => reader,
-            Err(user_error) => return Ok((self, Err(user_error))),
+            Ok(reader) => {
+                tracing::debug!("Documents enriched successfully");
+                reader
+            }
+            Err(user_error) => {
+                tracing::debug!("User error encountered during document enrichment: {:?}", user_error);
+                return Ok((self, Err(user_error)));
+            }
         };
 
+        tracing::debug!("Reading and indexing enriched documents");
         let indexed_documents =
             self.transform.as_mut().expect("Invalid document addition state").read_documents(
                 enriched_documents_reader,
@@ -171,8 +176,10 @@ where
                 &self.should_abort,
             )? as u64;
 
+        tracing::debug!("Indexed documents count: {}", indexed_documents);
         self.added_documents += indexed_documents;
 
+        tracing::debug!("Exiting add_documents function");
         Ok((self, Ok(indexed_documents)))
     }
 
